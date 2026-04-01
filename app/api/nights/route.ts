@@ -12,6 +12,53 @@ async function syncAttendees(supabase: ReturnType<typeof getSupabaseAdmin>, movi
   }
 }
 
+async function logNotificationEvent(supabase: ReturnType<typeof getSupabaseAdmin>, movieNightId: string, eventType: string) {
+  const { data: recipients } = await supabase
+    .from("members")
+    .select("id,name,email")
+    .eq("notifications_enabled", true)
+    .not("email", "is", null);
+
+  const { data: night } = await supabase
+    .from("movie_nights")
+    .select(`
+      id,
+      scheduled_for,
+      status,
+      notes,
+      movie:movies!movie_nights_movie_id_fkey(title),
+      picked_by:members!movie_nights_picked_by_member_id_fkey(name)
+    `)
+    .eq("id", movieNightId)
+    .single();
+
+  const payload = {
+    eventType,
+    night,
+    recipients: recipients ?? [],
+  };
+
+  await supabase.from("notification_events").insert({
+    movie_night_id: movieNightId,
+    event_type: eventType,
+    recipient_count: recipients?.length ?? 0,
+    payload,
+    delivery_status: process.env.SCHEDULE_WEBHOOK_URL ? "sent-attempted" : "logged",
+  });
+
+  if (process.env.SCHEDULE_WEBHOOK_URL) {
+    try {
+      await fetch(process.env.SCHEDULE_WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+    } catch {
+      // keep non-fatal so scheduling still works
+    }
+  }
+}
+
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
@@ -36,8 +83,8 @@ export async function POST(request: NextRequest) {
       if (insertRes.error || !insertRes.data) return NextResponse.json({ error: insertRes.error?.message ?? "Could not schedule movie night." }, { status: 400 });
 
       await syncAttendees(supabase, insertRes.data.id, attendeeIds);
-
       await supabase.from("movies").update({ status: "scheduled" }).eq("id", movieId);
+      await logNotificationEvent(supabase, insertRes.data.id, "scheduled");
       return NextResponse.json({ ok: true });
     }
 
@@ -70,6 +117,7 @@ export async function POST(request: NextRequest) {
         await supabase.from("movies").update({ status: "scheduled" }).eq("id", movieId);
       }
 
+      await logNotificationEvent(supabase, nightId, "schedule_updated");
       return NextResponse.json({ ok: true });
     }
 
@@ -84,6 +132,7 @@ export async function POST(request: NextRequest) {
       if (nightRes.error || !nightRes.data) return NextResponse.json({ error: nightRes.error?.message ?? "Could not update movie night." }, { status: 400 });
 
       await supabase.from("movies").update({ status: "watched" }).eq("id", nightRes.data.movie_id);
+      await logNotificationEvent(supabase, nightId, "marked_watched");
       return NextResponse.json({ ok: true });
     }
 

@@ -1,4 +1,9 @@
-export type Member = { id: string; name: string };
+export type Member = {
+  id: string;
+  name: string;
+  email?: string | null;
+  notifications_enabled?: boolean | null;
+};
 
 export type Movie = {
   id: string;
@@ -41,6 +46,22 @@ export type RotationRow = FairnessRow & {
   rotation_rank: number;
 };
 
+export type RatingRow = {
+  movie_id: string;
+  member_id: string;
+  rating: number;
+  review: string | null;
+  movie: Movie;
+  member: Member;
+};
+
+export type RatingSummaryRow = {
+  movie_id: string;
+  title: string;
+  average_rating: number;
+  rating_count: number;
+};
+
 export type DashboardData = {
   members: Member[];
   availableMovies: Movie[];
@@ -52,8 +73,11 @@ export type DashboardData = {
     scheduledCount: number;
     watchedCount: number;
     voteCount: number;
+    ratingsCount: number;
   };
   fairness: FairnessRow[];
   rotation: RotationRow[];
   votes: VoteRow[];
+  ratings: RatingRow[];
+  ratingSummary: RatingSummaryRow[];
 };

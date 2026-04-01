@@ -1,7 +1,7 @@
 'use client';
 
-import { useMemo, useState } from "react";
-import type { DashboardData, MovieNight } from "@/lib/types";
+import { useEffect, useMemo, useState } from "react";
+import type { DashboardData, Member, MovieNight } from "@/lib/types";
 
 type PickerResult = { title: string; runtime_minutes: number | null; reason: string } | null;
 type ScheduleEditor = {
@@ -18,17 +18,18 @@ async function postJSON(url: string, body: Record<string, unknown>, method = "PO
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-
   const payload = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new Error(payload.error || "Something went wrong.");
-  }
+  if (!res.ok) throw new Error(payload.error || "Something went wrong.");
   return payload;
 }
 
 function formatDate(value: string | null) {
   if (!value) return "TBD";
   return new Date(`${value}T12:00:00`).toLocaleDateString();
+}
+
+function stars(value: number) {
+  return "★".repeat(value) + "☆".repeat(5 - value);
 }
 
 function buildEditorState(night: MovieNight): ScheduleEditor {
@@ -44,33 +45,57 @@ function buildEditorState(night: MovieNight): ScheduleEditor {
 export function TrackerApp({ initialData }: { initialData: DashboardData }) {
   const [data, setData] = useState(initialData);
   const [busy, setBusy] = useState<string | null>(null);
-  const [pickerResult, setPickerResult] = useState<PickerResult>(null);
+  const [message, setMessage] = useState<string | null>(null);
   const [filterMaxRuntime, setFilterMaxRuntime] = useState("");
   const [pickerMode, setPickerMode] = useState("vote-rotation");
-  const [message, setMessage] = useState<string | null>(null);
-  const [selectedVoter, setSelectedVoter] = useState(data.members[0]?.id ?? "");
-  const [voteMovieId, setVoteMovieId] = useState("");
+  const [pickerResult, setPickerResult] = useState<PickerResult>(null);
   const [editingNightId, setEditingNightId] = useState<string | null>(null);
   const [editorState, setEditorState] = useState<ScheduleEditor | null>(null);
+  const [activeMemberId, setActiveMemberId] = useState(data.members[0]?.id ?? "");
+  const [memberEmail, setMemberEmail] = useState("");
+  const [notifyEnabled, setNotifyEnabled] = useState(false);
+  const [voteMovieId, setVoteMovieId] = useState("");
+  const [ratingMovieId, setRatingMovieId] = useState("");
+  const [ratingValue, setRatingValue] = useState("5");
+  const [ratingReview, setRatingReview] = useState("");
 
+  useEffect(() => {
+    const stored = window.localStorage.getItem("moobie-active-member-id");
+    if (stored && data.members.some((member) => member.id === stored)) {
+      setActiveMemberId(stored);
+    }
+  }, [data.members]);
+
+  useEffect(() => {
+    if (!activeMemberId) return;
+    window.localStorage.setItem("moobie-active-member-id", activeMemberId);
+    const member = data.members.find((item) => item.id === activeMemberId);
+    setMemberEmail(member?.email ?? "");
+    setNotifyEnabled(Boolean(member?.notifications_enabled));
+  }, [activeMemberId, data.members]);
+
+  const activeMember = useMemo(() => data.members.find((member) => member.id === activeMemberId) ?? null, [data.members, activeMemberId]);
   const availableMovies = useMemo(() => {
     const max = Number(filterMaxRuntime);
     if (!filterMaxRuntime || Number.isNaN(max)) return data.availableMovies;
     return data.availableMovies.filter((movie) => (movie.runtime_minutes ?? 0) <= max);
   }, [data.availableMovies, filterMaxRuntime]);
-
   const voteLookup = useMemo(() => {
     const map = new Map<string, { vote_count: number; voters: string[] }>();
     for (const vote of data.votes) map.set(vote.movie_id, { vote_count: vote.vote_count, voters: vote.voters });
     return map;
   }, [data.votes]);
-
+  const ratingLookup = useMemo(() => {
+    const map = new Map<string, { average_rating: number; rating_count: number }>();
+    for (const row of data.ratingSummary) map.set(row.movie_id, row);
+    return map;
+  }, [data.ratingSummary]);
+  const myRatings = useMemo(() => data.ratings.filter((row) => row.member_id === activeMemberId), [data.ratings, activeMemberId]);
   const nextUp = data.rotation[0] ?? null;
 
   async function refresh() {
     const res = await fetch("/api/dashboard", { cache: "no-store" });
-    const payload = await res.json();
-    setData(payload);
+    setData(await res.json());
   }
 
   function schedulableMoviesFor(night: MovieNight) {
@@ -82,7 +107,6 @@ export function TrackerApp({ initialData }: { initialData: DashboardData }) {
   function startEditing(night: MovieNight) {
     setEditingNightId(night.id);
     setEditorState(buildEditorState(night));
-    setMessage(null);
   }
 
   function cancelEditing() {
@@ -93,25 +117,23 @@ export function TrackerApp({ initialData }: { initialData: DashboardData }) {
   function toggleEditorAttendee(memberId: string, checked: boolean) {
     setEditorState((current) => {
       if (!current) return current;
-      const currentIds = new Set(current.attendee_ids);
-      if (checked) currentIds.add(memberId);
-      else currentIds.delete(memberId);
-      return { ...current, attendee_ids: [...currentIds] };
+      const ids = new Set(current.attendee_ids);
+      if (checked) ids.add(memberId);
+      else ids.delete(memberId);
+      return { ...current, attendee_ids: [...ids] };
     });
   }
 
-  async function handleAddMovie(formData: FormData) {
+  async function handleProfileSave() {
+    if (!activeMemberId) return;
     try {
-      setBusy("addMovie");
+      setBusy("profile");
       setMessage(null);
-      await postJSON("/api/movies", {
-        title: formData.get("title"),
-        runtime_minutes: formData.get("runtime_minutes"),
-      });
+      await postJSON("/api/members", { member_id: activeMemberId, email: memberEmail, notifications_enabled: notifyEnabled }, "PATCH");
       await refresh();
-      setMessage("Movie added.");
+      setMessage("Profile preferences saved.");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Could not add movie.");
+      setMessage(error instanceof Error ? error.message : "Could not save profile.");
     } finally {
       setBusy(null);
     }
@@ -130,7 +152,7 @@ export function TrackerApp({ initialData }: { initialData: DashboardData }) {
         attendee_ids: formData.getAll("attendee_ids"),
       });
       await refresh();
-      setMessage("Movie night scheduled.");
+      setMessage(notifyEnabled ? "Movie night scheduled. Notification event logged too." : "Movie night scheduled.");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Could not schedule movie.");
     } finally {
@@ -140,15 +162,10 @@ export function TrackerApp({ initialData }: { initialData: DashboardData }) {
 
   async function saveScheduledEdit() {
     if (!editingNightId || !editorState) return;
-
     try {
       setBusy(`edit-${editingNightId}`);
       setMessage(null);
-      await postJSON("/api/nights", {
-        action: "update_schedule",
-        night_id: editingNightId,
-        ...editorState,
-      });
+      await postJSON("/api/nights", { action: "update_schedule", night_id: editingNightId, ...editorState });
       await refresh();
       cancelEditing();
       setMessage("Scheduled movie updated.");
@@ -193,10 +210,7 @@ export function TrackerApp({ initialData }: { initialData: DashboardData }) {
     try {
       setBusy("picker");
       setMessage(null);
-      const payload = await postJSON("/api/picker", {
-        max_runtime: filterMaxRuntime || null,
-        mode: pickerMode,
-      });
+      const payload = await postJSON("/api/picker", { max_runtime: filterMaxRuntime || null, mode: pickerMode });
       setPickerResult(payload.result);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Could not pick a movie.");
@@ -207,13 +221,10 @@ export function TrackerApp({ initialData }: { initialData: DashboardData }) {
 
   async function castVote() {
     try {
-      if (!selectedVoter || !voteMovieId) {
-        setMessage("Choose a member and a movie first.");
-        return;
-      }
+      if (!activeMemberId || !voteMovieId) return setMessage("Pick a member and a movie first.");
       setBusy("vote");
       setMessage(null);
-      await postJSON("/api/votes", { member_id: selectedVoter, movie_id: voteMovieId });
+      await postJSON("/api/votes", { member_id: activeMemberId, movie_id: voteMovieId });
       await refresh();
       setMessage("Vote saved.");
     } catch (error) {
@@ -225,17 +236,49 @@ export function TrackerApp({ initialData }: { initialData: DashboardData }) {
 
   async function clearVote(movieId: string) {
     try {
-      if (!selectedVoter) {
-        setMessage("Choose a member first.");
-        return;
-      }
+      if (!activeMemberId) return setMessage("Choose a member first.");
       setBusy(`unvote-${movieId}`);
       setMessage(null);
-      await postJSON("/api/votes", { member_id: selectedVoter, movie_id: movieId }, "DELETE");
+      await postJSON("/api/votes", { member_id: activeMemberId, movie_id: movieId }, "DELETE");
       await refresh();
       setMessage("Vote removed.");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Could not remove vote.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function saveRating() {
+    try {
+      if (!activeMemberId || !ratingMovieId) return setMessage("Pick a member and a watched movie first.");
+      setBusy("rating");
+      setMessage(null);
+      await postJSON("/api/ratings", {
+        member_id: activeMemberId,
+        movie_id: ratingMovieId,
+        rating: Number(ratingValue),
+        review: ratingReview,
+      });
+      await refresh();
+      setMessage("Rating saved.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not save rating.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function removeRating(movieId: string) {
+    try {
+      if (!activeMemberId) return setMessage("Choose a member first.");
+      setBusy(`remove-rating-${movieId}`);
+      setMessage(null);
+      await postJSON("/api/ratings", { member_id: activeMemberId, movie_id: movieId }, "DELETE");
+      await refresh();
+      setMessage("Rating removed.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not remove rating.");
     } finally {
       setBusy(null);
     }
@@ -246,30 +289,63 @@ export function TrackerApp({ initialData }: { initialData: DashboardData }) {
       <section className="card hero">
         <div>
           <div className="eyebrow">Moobie Clurb HQ</div>
-          <h1>Vote smarter, rotate turns, pick faster.</h1>
-          <p className="subline">Shared movie tracker with club voting, an on-deck rotation, and an iPhone-friendly layout.</p>
+          <h1>Club identity, ratings, exports, and smarter scheduling.</h1>
+          <p className="subline">This version keeps the mobile-first tracker, adds remembered member identity, watched-movie ratings, backup export buttons, and notification-ready scheduling.</p>
         </div>
-        <div className="statsGrid">
+        <div className="statsGrid statsFive">
           <div className="stat"><div className="label">Total movies</div><div className="value">{data.stats.totalMovies}</div></div>
           <div className="stat"><div className="label">Available</div><div className="value">{data.stats.availableCount}</div></div>
-          <div className="stat"><div className="label">Watched</div><div className="value">{data.stats.watchedCount}</div></div>
+          <div className="stat"><div className="label">Scheduled</div><div className="value">{data.stats.scheduledCount}</div></div>
           <div className="stat"><div className="label">Votes cast</div><div className="value">{data.stats.voteCount}</div></div>
+          <div className="stat"><div className="label">Ratings</div><div className="value">{data.stats.ratingsCount}</div></div>
         </div>
         {message ? <div className="messageBar">{message}</div> : null}
       </section>
 
       <section className="grid two">
         <div className="card">
+          <h2>Your club profile</h2>
+          <p>Choose who you are on this device, add an email, and opt in for future schedule notifications.</p>
+          <label>
+            Active member
+            <select value={activeMemberId} onChange={(e) => setActiveMemberId(e.target.value)}>
+              {data.members.map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}
+            </select>
+          </label>
+          <label>
+            Email
+            <input value={memberEmail} onChange={(e) => setMemberEmail(e.target.value)} placeholder="name@example.com" />
+          </label>
+          <label className="checkRow">
+            <input type="checkbox" checked={notifyEnabled} onChange={(e) => setNotifyEnabled(e.target.checked)} />
+            <span>Receive schedule notifications when something is added or changed</span>
+          </label>
+          <div className="rowActions compactTop">
+            <button className="inline" onClick={() => void handleProfileSave()} disabled={busy === "profile"}>{busy === "profile" ? "Saving..." : "Save profile"}</button>
+            <span className="muted">Identity is remembered on this device. Email delivery can be turned on later with a webhook or mail provider.</span>
+          </div>
+        </div>
+
+        <div className="card">
+          <h2>Backup and export</h2>
+          <p>Download a full JSON backup or a simple CSV snapshot anytime.</p>
+          <div className="rowActions compactTop">
+            <a className="buttonLink" href="/api/export?format=json">Download JSON backup</a>
+            <a className="buttonLink secondaryLink" href="/api/export?format=csv">Download CSV</a>
+          </div>
+          <div className="featureCard compactTop">
+            <div className="eyebrow">Next up</div>
+            <h3>{nextUp?.name ?? "Nobody yet"}</h3>
+            <p>{nextUp ? `${nextUp.total_turns} total turns so far. Rotation still favors whoever has had the fewest turns.` : "Rotation will appear once members have activity."}</p>
+          </div>
+        </div>
+      </section>
+
+      <section className="grid two">
+        <div className="card">
           <h2>Club picker</h2>
-          <p>Use votes plus turn rotation, or switch to a runtime-based mode.</p>
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              void runPicker();
-            }}
-          >
-            <label>
-              Picker mode
+          <form onSubmit={(e) => { e.preventDefault(); void runPicker(); }}>
+            <label>Picker mode
               <select value={pickerMode} onChange={(e) => setPickerMode(e.target.value)}>
                 <option value="vote-rotation">Votes + turn rotation</option>
                 <option value="turn-rotation">Turn rotation first</option>
@@ -278,307 +354,171 @@ export function TrackerApp({ initialData }: { initialData: DashboardData }) {
                 <option value="pure-random">Pure random</option>
               </select>
             </label>
-            <label>
-              Max runtime in minutes
+            <label>Max runtime in minutes
               <input inputMode="numeric" placeholder="Optional, like 120" value={filterMaxRuntime} onChange={(e) => setFilterMaxRuntime(e.target.value)} />
             </label>
             <button type="submit" disabled={busy === "picker"}>{busy === "picker" ? "Picking..." : "Pick a movie"}</button>
           </form>
-          {pickerResult ? (
-            <div className="featureCard compactTop">
-              <div className="badge success">Suggestion</div>
-              <h3>{pickerResult.title}</h3>
-              <p>Runtime: {pickerResult.runtime_minutes ? `${pickerResult.runtime_minutes} min` : "Unknown"}</p>
-              <p>{pickerResult.reason}</p>
-            </div>
-          ) : null}
+          {pickerResult ? <div className="featureCard compactTop"><div className="badge success">Suggestion</div><h3>{pickerResult.title}</h3><p>{pickerResult.runtime_minutes ? `${pickerResult.runtime_minutes} min` : "Unknown runtime"}</p><p>{pickerResult.reason}</p></div> : null}
         </div>
 
         <div className="card">
-          <h2>On deck</h2>
-          <p>The rotation favors whoever has had the fewest total turns so far.</p>
-          {nextUp ? (
-            <div className="featureCard">
-              <div className="eyebrow">Next up</div>
-              <h3>{nextUp.name}</h3>
-              <p>{nextUp.total_turns} total turns so far, with {nextUp.watched_picks} already watched and {nextUp.scheduled_picks} still queued.</p>
-            </div>
-          ) : null}
-          <div className="stackList compactTop">
-            {data.rotation.slice(0, 4).map((row) => (
-              <div className="listItem" key={row.member_id}>
+          <h2>Voting</h2>
+          <p>Votes now default to your active member profile.</p>
+          <label>Movie to vote for
+            <select value={voteMovieId} onChange={(e) => setVoteMovieId(e.target.value)}>
+              <option value="">Choose a movie</option>
+              {availableMovies.map((movie) => <option key={movie.id} value={movie.id}>{movie.title}</option>)}
+            </select>
+          </label>
+          <button onClick={() => void castVote()} disabled={busy === "vote"}>{busy === "vote" ? "Saving..." : `Vote as ${activeMember?.name ?? "member"}`}</button>
+          <div className="stackList compactTop scrollList">
+            {data.votes.slice(0, 8).map((vote) => (
+              <div className="listItem" key={vote.movie_id}>
                 <div>
-                  <strong>#{row.rotation_rank} {row.name}</strong>
-                  <div className="muted">Watched {row.watched_picks} · Scheduled {row.scheduled_picks}</div>
+                  <strong>{vote.title}</strong>
+                  <div className="muted">{vote.vote_count} votes · {vote.voters.join(", ") || "No voters yet"}</div>
                 </div>
-                <span className="badge">{row.total_turns} turns</span>
+                <button className="inline secondary" onClick={() => void clearVote(vote.movie_id)} disabled={busy === `unvote-${vote.movie_id}`}>Remove mine</button>
               </div>
             ))}
           </div>
         </div>
       </section>
 
-      <section className="grid two">
-        <div className="card">
-          <h2>Cast votes</h2>
-          <p>Pick a club member, then vote for anything still in the backlog.</p>
-          <div className="voteControls">
-            <label>
-              Voting as
-              <select value={selectedVoter} onChange={(e) => setSelectedVoter(e.target.value)}>
-                {data.members.map((member) => (
-                  <option key={member.id} value={member.id}>{member.name}</option>
-                ))}
-              </select>
-            </label>
-            <label>
-              Movie
-              <select value={voteMovieId} onChange={(e) => setVoteMovieId(e.target.value)}>
-                <option value="">Choose one</option>
-                {availableMovies.map((movie) => (
-                  <option key={movie.id} value={movie.id}>{movie.title}{movie.runtime_minutes ? ` (${movie.runtime_minutes} min)` : ""}</option>
-                ))}
-              </select>
-            </label>
-            <button type="button" onClick={() => void castVote()} disabled={busy === "vote"}>{busy === "vote" ? "Saving..." : "Cast vote"}</button>
-          </div>
-
-          <div className="stackList compactTop">
-            {data.votes.length === 0 ? (
-              <div className="emptyState">No votes yet. Be the first one.</div>
-            ) : (
-              data.votes.slice(0, 6).map((vote) => (
-                <div className="listItem" key={vote.movie_id}>
-                  <div>
-                    <strong>{vote.title}</strong>
-                    <div className="muted">{vote.voters.join(", ") || "No voters yet"}</div>
-                  </div>
-                  <div className="rowActions">
-                    <span className="badge warning">{vote.vote_count} vote{vote.vote_count === 1 ? "" : "s"}</span>
-                    <button className="inline secondary" type="button" onClick={() => void clearVote(vote.movie_id)} disabled={busy === `unvote-${vote.movie_id}`}>
-                      {busy === `unvote-${vote.movie_id}` ? "Removing..." : "Remove mine"}
-                    </button>
-                  </div>
-                </div>
-              ))
-            )}
-          </div>
-        </div>
-
-        <div className="card">
-          <h2>Schedule a movie night</h2>
-          <p>{nextUp ? `Recommended pick owner: ${nextUp.name}.` : "Pick an owner or leave it open."}</p>
-          <form action={handleScheduleMovie}>
-            <label>
-              Movie
+      <section className="card">
+        <h2>Schedule a movie night</h2>
+        <form action={handleScheduleMovie}>
+          <div className="grid two singleOnMobile compactTop">
+            <label>Movie
               <select name="movie_id" required>
-                <option value="">Choose one</option>
-                {availableMovies.map((movie) => {
-                  const voteInfo = voteLookup.get(movie.id);
-                  return (
-                    <option key={movie.id} value={movie.id}>
-                      {movie.title}
-                      {movie.runtime_minutes ? ` (${movie.runtime_minutes} min)` : ""}
-                      {voteInfo ? ` · ${voteInfo.vote_count} vote${voteInfo.vote_count === 1 ? "" : "s"}` : ""}
-                    </option>
-                  );
-                })}
-              </select>
-            </label>
-            <label>
-              Picked by
-              <select name="picked_by_member_id" defaultValue={nextUp?.member_id ?? ""}>
-                <option value="">No pick owner yet</option>
-                {data.members.map((member) => (
-                  <option key={member.id} value={member.id}>{member.name}</option>
+                <option value="">Choose a movie</option>
+                {availableMovies.map((movie) => (
+                  <option key={movie.id} value={movie.id}>{movie.title}{movie.runtime_minutes ? ` · ${movie.runtime_minutes} min` : ""}</option>
                 ))}
               </select>
             </label>
-            <label>
-              Scheduled date
+            <label>Picked by
+              <select name="picked_by_member_id" defaultValue={activeMemberId || nextUp?.member_id || ""}>
+                {data.members.map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}
+              </select>
+            </label>
+            <label>Date
               <input type="date" name="scheduled_for" />
             </label>
-            <label>
-              Notes
-              <textarea name="notes" placeholder="Host, snacks, theme, arrival time, whatever helps" />
+            <label>Notes
+              <input name="notes" placeholder="Theme, host, snacks, anything helpful" />
             </label>
-            <div>
-              <div className="sectionLabel">Expected attendees</div>
-              <div className="memberPills">
-                {data.members.map((member) => (
-                  <label className="pill" key={member.id}>
-                    <input type="checkbox" name="attendee_ids" value={member.id} style={{ width: 16, height: 16 }} />
-                    <span>{member.name}</span>
-                  </label>
-                ))}
-              </div>
-            </div>
-            <button type="submit" disabled={busy === "scheduleMovie"}>{busy === "scheduleMovie" ? "Saving..." : "Schedule movie night"}</button>
-          </form>
-        </div>
+          </div>
+          <div className="sectionLabel compactTop">Attendees</div>
+          <div className="memberPills">
+            {data.members.map((member) => (
+              <label key={member.id} className="pill"><input type="checkbox" name="attendee_ids" value={member.id} defaultChecked={member.id === activeMemberId} /> {member.name}</label>
+            ))}
+          </div>
+          <button className="compactTop" type="submit" disabled={busy === "scheduleMovie"}>{busy === "scheduleMovie" ? "Scheduling..." : "Schedule movie night"}</button>
+        </form>
       </section>
 
-      <section className="grid two singleOnMobile">
+      <section className="grid two">
         <div className="card">
           <h2>Upcoming / scheduled</h2>
           <div className="stackList compactTop">
-            {data.scheduledNights.length === 0 ? (
-              <div className="emptyState">No scheduled nights yet.</div>
-            ) : (
-              data.scheduledNights.map((night) => {
-                const isEditing = editingNightId === night.id && editorState;
-                const editableMovies = schedulableMoviesFor(night);
-
-                return (
-                  <div className="featureCard" key={night.id}>
-                    <div className="rowSplit">
-                      <div>
-                        <h3>{night.movie.title}</h3>
-                        <div className="muted">{night.movie.runtime_minutes ? `${night.movie.runtime_minutes} min` : "Unknown runtime"}</div>
-                      </div>
-                      <span className="badge">{formatDate(night.scheduled_for)}</span>
-                    </div>
-                    <p>Picked by: {night.picked_by?.name ?? "—"}</p>
-                    <p>Attending: {night.attendees.map((a) => a.member.name).join(", ") || "—"}</p>
-                    <p>Notes: {night.notes || "—"}</p>
-
-                    {isEditing ? (
-                      <div className="editPanel compactTop">
-                        <label>
-                          Movie
-                          <select
-                            value={editorState.movie_id}
-                            onChange={(e) => setEditorState((current) => current ? { ...current, movie_id: e.target.value } : current)}
-                          >
-                            {editableMovies.map((movie) => {
-                              const voteInfo = voteLookup.get(movie.id);
-                              return (
-                                <option key={movie.id} value={movie.id}>
-                                  {movie.title}
-                                  {movie.runtime_minutes ? ` (${movie.runtime_minutes} min)` : ""}
-                                  {voteInfo ? ` · ${voteInfo.vote_count} vote${voteInfo.vote_count === 1 ? "" : "s"}` : ""}
-                                </option>
-                              );
-                            })}
-                          </select>
-                        </label>
-                        <label>
-                          Picked by
-                          <select
-                            value={editorState.picked_by_member_id}
-                            onChange={(e) => setEditorState((current) => current ? { ...current, picked_by_member_id: e.target.value } : current)}
-                          >
-                            <option value="">No pick owner yet</option>
-                            {data.members.map((member) => (
-                              <option key={member.id} value={member.id}>{member.name}</option>
-                            ))}
-                          </select>
-                        </label>
-                        <label>
-                          Scheduled date
-                          <input
-                            type="date"
-                            value={editorState.scheduled_for}
-                            onChange={(e) => setEditorState((current) => current ? { ...current, scheduled_for: e.target.value } : current)}
-                          />
-                        </label>
-                        <label>
-                          Notes
-                          <textarea
-                            value={editorState.notes}
-                            onChange={(e) => setEditorState((current) => current ? { ...current, notes: e.target.value } : current)}
-                          />
-                        </label>
-                        <div>
-                          <div className="sectionLabel">Expected attendees</div>
-                          <div className="memberPills">
-                            {data.members.map((member) => (
-                              <label className="pill" key={member.id}>
-                                <input
-                                  type="checkbox"
-                                  checked={editorState.attendee_ids.includes(member.id)}
-                                  onChange={(e) => toggleEditorAttendee(member.id, e.target.checked)}
-                                  style={{ width: 16, height: 16 }}
-                                />
-                                <span>{member.name}</span>
-                              </label>
-                            ))}
-                          </div>
-                        </div>
-                        <div className="rowActions compactTop">
-                          <button type="button" onClick={() => void saveScheduledEdit()} disabled={busy === `edit-${night.id}`}>
-                            {busy === `edit-${night.id}` ? "Saving..." : "Save changes"}
-                          </button>
-                          <button className="secondary" type="button" onClick={cancelEditing}>Cancel</button>
-                        </div>
-                      </div>
-                    ) : null}
-
-                    <div className="rowActions compactTop">
-                      <button className="secondary" type="button" onClick={() => startEditing(night)} disabled={busy === `remove-${night.id}` || busy === night.id}>
-                        Edit
-                      </button>
-                      <button className="secondary" onClick={() => void markWatched(night.id)} disabled={busy === night.id}>
-                        {busy === night.id ? "Saving..." : "Mark watched"}
-                      </button>
-                      <button className="danger" type="button" onClick={() => void removeScheduledNight(night.id)} disabled={busy === `remove-${night.id}`}>
-                        {busy === `remove-${night.id}` ? "Removing..." : "Remove"}
-                      </button>
-                    </div>
+            {data.scheduledNights.length === 0 ? <div className="emptyState">Nothing scheduled yet.</div> : data.scheduledNights.map((night) => {
+              const isEditing = editingNightId === night.id && editorState;
+              return (
+                <div className="featureCard" key={night.id}>
+                  <div className="rowSplit"><strong>{night.movie.title}</strong><span className="badge warning">{formatDate(night.scheduled_for)}</span></div>
+                  <p>Picked by {night.picked_by?.name ?? "Unknown"}</p>
+                  <p>{night.notes || "No notes yet."}</p>
+                  <div className="muted">Attendees: {night.attendees.map((a) => a.member.name).join(", ") || "None yet"}</div>
+                  <div className="rowActions">
+                    <button className="inline secondary" onClick={() => startEditing(night)}>Edit</button>
+                    <button className="inline" onClick={() => void markWatched(night.id)} disabled={busy === night.id}>Mark watched</button>
+                    <button className="inline danger" onClick={() => void removeScheduledNight(night.id)} disabled={busy === `remove-${night.id}`}>Remove</button>
                   </div>
-                );
-              })
-            )}
+                  {isEditing ? (
+                    <div className="editPanel">
+                      <label>Movie
+                        <select value={editorState.movie_id} onChange={(e) => setEditorState({ ...editorState, movie_id: e.target.value })}>
+                          {schedulableMoviesFor(night).map((movie) => <option key={movie.id} value={movie.id}>{movie.title}</option>)}
+                        </select>
+                      </label>
+                      <label>Picked by
+                        <select value={editorState.picked_by_member_id} onChange={(e) => setEditorState({ ...editorState, picked_by_member_id: e.target.value })}>
+                          <option value="">Unassigned</option>
+                          {data.members.map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}
+                        </select>
+                      </label>
+                      <label>Date
+                        <input type="date" value={editorState.scheduled_for} onChange={(e) => setEditorState({ ...editorState, scheduled_for: e.target.value })} />
+                      </label>
+                      <label>Notes
+                        <textarea value={editorState.notes} onChange={(e) => setEditorState({ ...editorState, notes: e.target.value })} />
+                      </label>
+                      <div className="memberPills">
+                        {data.members.map((member) => (
+                          <label key={member.id} className="pill"><input type="checkbox" checked={editorState.attendee_ids.includes(member.id)} onChange={(e) => toggleEditorAttendee(member.id, e.target.checked)} /> {member.name}</label>
+                        ))}
+                      </div>
+                      <div className="rowActions">
+                        <button className="inline" onClick={() => void saveScheduledEdit()} disabled={busy === `edit-${night.id}`}>Save changes</button>
+                        <button className="inline secondary" onClick={cancelEditing}>Cancel</button>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              );
+            })}
           </div>
         </div>
 
         <div className="card">
-          <h2>Add a movie</h2>
-          <p>Drop a new title into the shared backlog.</p>
-          <form action={handleAddMovie}>
-            <label>
-              Movie title
-              <input name="title" required placeholder="Movie title" />
+          <h2>Ratings + club favorites</h2>
+          <p>Rate watched movies from 1 to 5 stars. Your rating sticks to your active member profile.</p>
+          <div className="grid two singleOnMobile compactTop">
+            <label>Watched movie
+              <select value={ratingMovieId} onChange={(e) => setRatingMovieId(e.target.value)}>
+                <option value="">Choose a watched movie</option>
+                {data.watchedNights.map((night) => <option key={night.id} value={night.movie_id}>{night.movie.title}</option>)}
+              </select>
             </label>
-            <label>
-              Runtime in minutes
-              <input name="runtime_minutes" inputMode="numeric" placeholder="Optional" />
+            <label>Rating
+              <select value={ratingValue} onChange={(e) => setRatingValue(e.target.value)}>
+                {[5,4,3,2,1].map((n) => <option key={n} value={n}>{n} / 5</option>)}
+              </select>
             </label>
-            <button type="submit" disabled={busy === "addMovie"}>{busy === "addMovie" ? "Adding..." : "Add movie"}</button>
-          </form>
-        </div>
-      </section>
-
-      <section className="card">
-        <h2>Backlog pulse</h2>
-        <div className="stackList compactTop">
-          {availableMovies.map((movie) => {
-            const voteInfo = voteLookup.get(movie.id);
-            return (
-              <div className="listItem" key={movie.id}>
-                <div>
-                  <strong>{movie.title}</strong>
-                  <div className="muted">{movie.runtime_minutes ? `${movie.runtime_minutes} min` : "Runtime unknown"} · {movie.source_list ?? "source unknown"}</div>
+          </div>
+          <label className="compactTop">Short note
+            <input value={ratingReview} onChange={(e) => setRatingReview(e.target.value)} placeholder="What worked, what surprised you, why it ruled or did not" />
+          </label>
+          <button className="compactTop" onClick={() => void saveRating()} disabled={busy === "rating"}>{busy === "rating" ? "Saving..." : `Save rating as ${activeMember?.name ?? "member"}`}</button>
+          <div className="featureCard compactTop">
+            <div className="eyebrow">Top rated right now</div>
+            <div className="stackList">
+              {data.ratingSummary.slice(0, 5).map((row) => (
+                <div className="listItem" key={row.movie_id}>
+                  <div>
+                    <strong>{row.title}</strong>
+                    <div className="muted">{row.average_rating.toFixed(2)} average · {row.rating_count} rating{row.rating_count === 1 ? "" : "s"}</div>
+                  </div>
+                  <span className="badge success">{row.average_rating.toFixed(1)}</span>
                 </div>
-                <span className="badge warning">{voteInfo?.vote_count ?? 0} vote{(voteInfo?.vote_count ?? 0) === 1 ? "" : "s"}</span>
-              </div>
-            );
-          })}
-        </div>
-      </section>
-
-      <section className="card">
-        <h2>Watch history</h2>
-        <div className="stackList compactTop">
-          {data.watchedNights.map((night) => (
-            <div className="listItem" key={night.id}>
-              <div>
-                <strong>{night.movie.title}</strong>
-                <div className="muted">Picked by {night.picked_by?.name ?? "—"} · Watched {formatDate(night.watched_on)}</div>
-              </div>
-              <span className="badge">{night.attendees.length} attending</span>
+              ))}
             </div>
-          ))}
+          </div>
+          <div className="sectionLabel compactTop">Your recent ratings</div>
+          <div className="stackList scrollList">
+            {myRatings.length === 0 ? <div className="emptyState">No ratings from this member yet.</div> : myRatings.slice().reverse().map((row) => (
+              <div className="listItem" key={`${row.movie_id}-${row.member_id}`}>
+                <div>
+                  <strong>{row.movie.title}</strong>
+                  <div className="muted">{stars(row.rating)}{row.review ? ` · ${row.review}` : ""}</div>
+                </div>
+                <button className="inline secondary" onClick={() => void removeRating(row.movie_id)} disabled={busy === `remove-rating-${row.movie_id}`}>Remove</button>
+              </div>
+            ))}
+          </div>
         </div>
       </section>
     </main>

@@ -1,5 +1,14 @@
 import { getSupabaseAdmin } from "@/lib/supabase";
-import type { DashboardData, FairnessRow, Member, Movie, MovieNight, VoteRow } from "@/lib/types";
+import type {
+  DashboardData,
+  FairnessRow,
+  Member,
+  Movie,
+  MovieNight,
+  RatingRow,
+  RatingSummaryRow,
+  VoteRow,
+} from "@/lib/types";
 
 type RawNight = {
   id: string;
@@ -22,6 +31,15 @@ type RawNight = {
 type RawVote = {
   movie_id: string;
   member_id: string;
+  movie: Movie[] | Movie | null;
+  member: Member[] | Member | null;
+};
+
+type RawRating = {
+  movie_id: string;
+  member_id: string;
+  rating: number;
+  review: string | null;
   movie: Movie[] | Movie | null;
   member: Member[] | Member | null;
 };
@@ -51,6 +69,20 @@ function normalizeNight(night: RawNight): MovieNight | null {
         return member ? { member_id: attendee.member_id, member } : null;
       })
       .filter((attendee): attendee is { member_id: string; member: Member } => attendee !== null),
+  };
+}
+
+function normalizeRating(row: RawRating): RatingRow | null {
+  const movie = firstOrNull<Movie>(row.movie);
+  const member = firstOrNull<Member>(row.member);
+  if (!movie || !member) return null;
+  return {
+    movie_id: row.movie_id,
+    member_id: row.member_id,
+    rating: row.rating,
+    review: row.review,
+    movie,
+    member,
   };
 }
 
@@ -88,8 +120,8 @@ function buildRotationRows(fairness: FairnessRow[]) {
 export async function getDashboardData(): Promise<DashboardData> {
   const supabase = getSupabaseAdmin();
 
-  const [membersRes, moviesRes, nightsRes, fairnessRes, votesRes] = await Promise.all([
-    supabase.from("members").select("id,name").order("name"),
+  const [membersRes, moviesRes, nightsRes, fairnessRes, votesRes, ratingsRes, ratingSummaryRes] = await Promise.all([
+    supabase.from("members").select("id,name,email,notifications_enabled").order("name"),
     supabase.from("movies").select("id,title,runtime_minutes,status,source_list").order("title"),
     supabase
       .from("movie_nights")
@@ -102,10 +134,10 @@ export async function getDashboardData(): Promise<DashboardData> {
         status,
         notes,
         movie:movies!movie_nights_movie_id_fkey(id,title,runtime_minutes,status,source_list),
-        picked_by:members!movie_nights_picked_by_member_id_fkey(id,name),
+        picked_by:members!movie_nights_picked_by_member_id_fkey(id,name,email,notifications_enabled),
         attendees:night_attendees(
           member_id,
-          member:members!night_attendees_member_id_fkey(id,name)
+          member:members!night_attendees_member_id_fkey(id,name,email,notifications_enabled)
         )
       `)
       .order("watched_on", { ascending: false, nullsFirst: false })
@@ -116,11 +148,20 @@ export async function getDashboardData(): Promise<DashboardData> {
       movie_id,
       member_id,
       movie:movies!movie_votes_movie_id_fkey(id,title,runtime_minutes,status,source_list),
-      member:members!movie_votes_member_id_fkey(id,name)
+      member:members!movie_votes_member_id_fkey(id,name,email,notifications_enabled)
     `),
+    supabase.from("movie_ratings").select(`
+      movie_id,
+      member_id,
+      rating,
+      review,
+      movie:movies!movie_ratings_movie_id_fkey(id,title,runtime_minutes,status,source_list),
+      member:members!movie_ratings_member_id_fkey(id,name,email,notifications_enabled)
+    `),
+    supabase.from("movie_rating_summary").select("*").order("average_rating", { ascending: false }),
   ]);
 
-  for (const res of [membersRes, moviesRes, nightsRes, fairnessRes, votesRes]) {
+  for (const res of [membersRes, moviesRes, nightsRes, fairnessRes, votesRes, ratingsRes, ratingSummaryRes]) {
     if (res.error) throw new Error(res.error.message);
   }
 
@@ -130,6 +171,12 @@ export async function getDashboardData(): Promise<DashboardData> {
     .map(normalizeNight)
     .filter((night): night is MovieNight => night !== null);
   const votes = buildVoteRows((votesRes.data ?? []) as RawVote[]);
+  const ratings = ((ratingsRes.data ?? []) as RawRating[])
+    .map(normalizeRating)
+    .filter((row): row is RatingRow => row !== null);
+  const ratingSummary = ((ratingSummaryRes.data ?? []) as RatingSummaryRow[]).sort(
+    (a, b) => b.average_rating - a.average_rating || b.rating_count - a.rating_count || a.title.localeCompare(b.title)
+  );
   const rotation = buildRotationRows(fairness);
 
   return {
@@ -143,9 +190,12 @@ export async function getDashboardData(): Promise<DashboardData> {
       scheduledCount: allNights.filter((night) => night.status === "scheduled").length,
       watchedCount: allNights.filter((night) => night.status === "watched").length,
       voteCount: votes.reduce((sum, row) => sum + row.vote_count, 0),
+      ratingsCount: ratings.length,
     },
     fairness,
     rotation,
     votes,
+    ratings,
+    ratingSummary,
   };
 }

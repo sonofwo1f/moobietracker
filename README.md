@@ -27,3 +27,8 @@ Run `supabase/schema.sql` in the Supabase SQL Editor.
 
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
+
+
+## Upgrade note for votes + rotation
+
+Before deploying this upgraded version, run the SQL in `supabase/migrations/2026-04-01-votes-and-rotation.sql` inside the Supabase SQL Editor. That adds the `movie_votes` table used by the voting UI and the vote-aware picker.

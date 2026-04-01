@@ -5,9 +5,9 @@ import type { DashboardData } from "@/lib/types";
 
 type PickerResult = { title: string; runtime_minutes: number | null; reason: string } | null;
 
-async function postJSON(url: string, body: Record<string, unknown>) {
+async function postJSON(url: string, body: Record<string, unknown>, method = "POST") {
   const res = await fetch(url, {
-    method: "POST",
+    method,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
@@ -19,19 +19,34 @@ async function postJSON(url: string, body: Record<string, unknown>) {
   return payload;
 }
 
+function formatDate(value: string | null) {
+  if (!value) return "TBD";
+  return new Date(`${value}T12:00:00`).toLocaleDateString();
+}
+
 export function TrackerApp({ initialData }: { initialData: DashboardData }) {
   const [data, setData] = useState(initialData);
   const [busy, setBusy] = useState<string | null>(null);
   const [pickerResult, setPickerResult] = useState<PickerResult>(null);
   const [filterMaxRuntime, setFilterMaxRuntime] = useState("");
-  const [pickerMode, setPickerMode] = useState("fairness");
+  const [pickerMode, setPickerMode] = useState("vote-rotation");
   const [message, setMessage] = useState<string | null>(null);
+  const [selectedVoter, setSelectedVoter] = useState(data.members[0]?.id ?? "");
+  const [voteMovieId, setVoteMovieId] = useState("");
 
   const availableMovies = useMemo(() => {
     const max = Number(filterMaxRuntime);
     if (!filterMaxRuntime || Number.isNaN(max)) return data.availableMovies;
     return data.availableMovies.filter((movie) => (movie.runtime_minutes ?? 0) <= max);
   }, [data.availableMovies, filterMaxRuntime]);
+
+  const voteLookup = useMemo(() => {
+    const map = new Map<string, { vote_count: number; voters: string[] }>();
+    for (const vote of data.votes) map.set(vote.movie_id, { vote_count: vote.vote_count, voters: vote.voters });
+    return map;
+  }, [data.votes]);
+
+  const nextUp = data.rotation[0] ?? null;
 
   async function refresh() {
     const res = await fetch("/api/dashboard", { cache: "no-store" });
@@ -107,34 +122,63 @@ export function TrackerApp({ initialData }: { initialData: DashboardData }) {
     }
   }
 
+  async function castVote() {
+    try {
+      if (!selectedVoter || !voteMovieId) {
+        setMessage("Choose a member and a movie first.");
+        return;
+      }
+      setBusy("vote");
+      setMessage(null);
+      await postJSON("/api/votes", { member_id: selectedVoter, movie_id: voteMovieId });
+      await refresh();
+      setMessage("Vote saved.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not save vote.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function clearVote(movieId: string) {
+    try {
+      if (!selectedVoter) {
+        setMessage("Choose a member first.");
+        return;
+      }
+      setBusy(`unvote-${movieId}`);
+      setMessage(null);
+      await postJSON("/api/votes", { member_id: selectedVoter, movie_id: movieId }, "DELETE");
+      await refresh();
+      setMessage("Vote removed.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not remove vote.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
   return (
     <main>
       <section className="card hero">
         <div>
-          <h1>Moobie Clurb</h1>
-          <p className="subline">Shared movie tracker, picker, schedule board, and fairness dashboard.</p>
+          <div className="eyebrow">Moobie Clurb HQ</div>
+          <h1>Vote smarter, rotate turns, pick faster.</h1>
+          <p className="subline">Shared movie tracker with club voting, an on-deck rotation, and an iPhone-friendly layout.</p>
         </div>
-        <div className="grid three">
-          <div className="stat">
-            <div className="label">Total movies</div>
-            <div className="value">{data.stats.totalMovies}</div>
-          </div>
-          <div className="stat">
-            <div className="label">Available to pick</div>
-            <div className="value">{data.stats.availableCount}</div>
-          </div>
-          <div className="stat">
-            <div className="label">Already watched</div>
-            <div className="value">{data.stats.watchedCount}</div>
-          </div>
+        <div className="statsGrid">
+          <div className="stat"><div className="label">Total movies</div><div className="value">{data.stats.totalMovies}</div></div>
+          <div className="stat"><div className="label">Available</div><div className="value">{data.stats.availableCount}</div></div>
+          <div className="stat"><div className="label">Watched</div><div className="value">{data.stats.watchedCount}</div></div>
+          <div className="stat"><div className="label">Votes cast</div><div className="value">{data.stats.voteCount}</div></div>
         </div>
-        {message ? <p>{message}</p> : null}
+        {message ? <div className="messageBar">{message}</div> : null}
       </section>
 
       <section className="grid two">
         <div className="card">
-          <h2>Pick the next movie</h2>
-          <p>Run a quick picker. Fairness mode nudges the result toward members who have had fewer picks.</p>
+          <h2>Club picker</h2>
+          <p>Use votes plus turn rotation, or switch to a runtime-based mode.</p>
           <form
             onSubmit={(e) => {
               e.preventDefault();
@@ -144,7 +188,8 @@ export function TrackerApp({ initialData }: { initialData: DashboardData }) {
             <label>
               Picker mode
               <select value={pickerMode} onChange={(e) => setPickerMode(e.target.value)}>
-                <option value="fairness">Fairness</option>
+                <option value="vote-rotation">Votes + turn rotation</option>
+                <option value="turn-rotation">Turn rotation first</option>
                 <option value="short-night">Short night</option>
                 <option value="epic-night">Epic night</option>
                 <option value="pure-random">Pure random</option>
@@ -154,65 +199,115 @@ export function TrackerApp({ initialData }: { initialData: DashboardData }) {
               Max runtime in minutes
               <input inputMode="numeric" placeholder="Optional, like 120" value={filterMaxRuntime} onChange={(e) => setFilterMaxRuntime(e.target.value)} />
             </label>
-            <button type="submit" disabled={busy === "picker"}>
-              {busy === "picker" ? "Picking..." : "Pick a movie"}
-            </button>
+            <button type="submit" disabled={busy === "picker"}>{busy === "picker" ? "Picking..." : "Pick a movie"}</button>
           </form>
-
           {pickerResult ? (
-            <div className="card" style={{ marginTop: 12, padding: 14 }}>
+            <div className="featureCard compactTop">
               <div className="badge success">Suggestion</div>
-              <h3 style={{ marginTop: 10 }}>{pickerResult.title}</h3>
-              <p>
-                Runtime: {pickerResult.runtime_minutes ? `${pickerResult.runtime_minutes} min` : "Unknown"}<br />
-                {pickerResult.reason}
-              </p>
+              <h3>{pickerResult.title}</h3>
+              <p>Runtime: {pickerResult.runtime_minutes ? `${pickerResult.runtime_minutes} min` : "Unknown"}</p>
+              <p>{pickerResult.reason}</p>
             </div>
           ) : null}
         </div>
 
         <div className="card">
-          <h2>Add a movie</h2>
-          <p>Add a new movie to the backlog without touching the database directly.</p>
-          <form action={handleAddMovie}>
-            <label>
-              Movie title
-              <input name="title" required placeholder="Movie title" />
-            </label>
-            <label>
-              Runtime in minutes
-              <input name="runtime_minutes" inputMode="numeric" placeholder="Optional" />
-            </label>
-            <button type="submit" disabled={busy === "addMovie"}>
-              {busy === "addMovie" ? "Adding..." : "Add movie"}
-            </button>
-          </form>
+          <h2>On deck</h2>
+          <p>The rotation favors whoever has had the fewest total turns so far.</p>
+          {nextUp ? (
+            <div className="featureCard">
+              <div className="eyebrow">Next up</div>
+              <h3>{nextUp.name}</h3>
+              <p>{nextUp.total_turns} total turns so far, with {nextUp.watched_picks} already watched and {nextUp.scheduled_picks} still queued.</p>
+            </div>
+          ) : null}
+          <div className="stackList compactTop">
+            {data.rotation.slice(0, 4).map((row) => (
+              <div className="listItem" key={row.member_id}>
+                <div>
+                  <strong>#{row.rotation_rank} {row.name}</strong>
+                  <div className="muted">Watched {row.watched_picks} · Scheduled {row.scheduled_picks}</div>
+                </div>
+                <span className="badge">{row.total_turns} turns</span>
+              </div>
+            ))}
+          </div>
         </div>
       </section>
 
-      <section className="grid two" style={{ marginTop: 16 }}>
+      <section className="grid two">
+        <div className="card">
+          <h2>Cast votes</h2>
+          <p>Pick a club member, then vote for anything still in the backlog.</p>
+          <div className="voteControls">
+            <label>
+              Voting as
+              <select value={selectedVoter} onChange={(e) => setSelectedVoter(e.target.value)}>
+                {data.members.map((member) => (
+                  <option key={member.id} value={member.id}>{member.name}</option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Movie
+              <select value={voteMovieId} onChange={(e) => setVoteMovieId(e.target.value)}>
+                <option value="">Choose one</option>
+                {availableMovies.map((movie) => (
+                  <option key={movie.id} value={movie.id}>{movie.title}{movie.runtime_minutes ? ` (${movie.runtime_minutes} min)` : ""}</option>
+                ))}
+              </select>
+            </label>
+            <button type="button" onClick={() => void castVote()} disabled={busy === "vote"}>{busy === "vote" ? "Saving..." : "Cast vote"}</button>
+          </div>
+
+          <div className="stackList compactTop">
+            {data.votes.length === 0 ? (
+              <div className="emptyState">No votes yet. Be the first one.</div>
+            ) : (
+              data.votes.slice(0, 6).map((vote) => (
+                <div className="listItem" key={vote.movie_id}>
+                  <div>
+                    <strong>{vote.title}</strong>
+                    <div className="muted">{vote.voters.join(", ") || "No voters yet"}</div>
+                  </div>
+                  <div className="rowActions">
+                    <span className="badge warning">{vote.vote_count} vote{vote.vote_count === 1 ? "" : "s"}</span>
+                    <button className="inline secondary" type="button" onClick={() => void clearVote(vote.movie_id)} disabled={busy === `unvote-${vote.movie_id}`}>
+                      {busy === `unvote-${vote.movie_id}` ? "Removing..." : "Remove mine"}
+                    </button>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+
         <div className="card">
           <h2>Schedule a movie night</h2>
+          <p>{nextUp ? `Recommended pick owner: ${nextUp.name}.` : "Pick an owner or leave it open."}</p>
           <form action={handleScheduleMovie}>
             <label>
               Movie
               <select name="movie_id" required>
                 <option value="">Choose one</option>
-                {availableMovies.map((movie) => (
-                  <option key={movie.id} value={movie.id}>
-                    {movie.title}{movie.runtime_minutes ? ` (${movie.runtime_minutes} min)` : ""}
-                  </option>
-                ))}
+                {availableMovies.map((movie) => {
+                  const voteInfo = voteLookup.get(movie.id);
+                  return (
+                    <option key={movie.id} value={movie.id}>
+                      {movie.title}
+                      {movie.runtime_minutes ? ` (${movie.runtime_minutes} min)` : ""}
+                      {voteInfo ? ` · ${voteInfo.vote_count} vote${voteInfo.vote_count === 1 ? "" : "s"}` : ""}
+                    </option>
+                  );
+                })}
               </select>
             </label>
             <label>
               Picked by
-              <select name="picked_by_member_id">
+              <select name="picked_by_member_id" defaultValue={nextUp?.member_id ?? ""}>
                 <option value="">No pick owner yet</option>
                 {data.members.map((member) => (
-                  <option key={member.id} value={member.id}>
-                    {member.name}
-                  </option>
+                  <option key={member.id} value={member.id}>{member.name}</option>
                 ))}
               </select>
             </label>
@@ -222,10 +317,10 @@ export function TrackerApp({ initialData }: { initialData: DashboardData }) {
             </label>
             <label>
               Notes
-              <textarea name="notes" placeholder="Snacks, theme, host, or anything else" />
+              <textarea name="notes" placeholder="Host, snacks, theme, arrival time, whatever helps" />
             </label>
             <div>
-              <div style={{ marginBottom: 8, color: "var(--accent-2)" }}>Expected attendees</div>
+              <div className="sectionLabel">Expected attendees</div>
               <div className="memberPills">
                 {data.members.map((member) => (
                   <label className="pill" key={member.id}>
@@ -235,130 +330,84 @@ export function TrackerApp({ initialData }: { initialData: DashboardData }) {
                 ))}
               </div>
             </div>
-            <button type="submit" disabled={busy === "scheduleMovie"}>
-              {busy === "scheduleMovie" ? "Saving..." : "Schedule movie night"}
-            </button>
+            <button type="submit" disabled={busy === "scheduleMovie"}>{busy === "scheduleMovie" ? "Saving..." : "Schedule movie night"}</button>
           </form>
+        </div>
+      </section>
+
+      <section className="grid two singleOnMobile">
+        <div className="card">
+          <h2>Upcoming / scheduled</h2>
+          <div className="stackList compactTop">
+            {data.scheduledNights.length === 0 ? (
+              <div className="emptyState">No scheduled nights yet.</div>
+            ) : (
+              data.scheduledNights.map((night) => (
+                <div className="featureCard" key={night.id}>
+                  <div className="rowSplit">
+                    <div>
+                      <h3>{night.movie.title}</h3>
+                      <div className="muted">{night.movie.runtime_minutes ? `${night.movie.runtime_minutes} min` : "Unknown runtime"}</div>
+                    </div>
+                    <span className="badge">{formatDate(night.scheduled_for)}</span>
+                  </div>
+                  <p>Picked by: {night.picked_by?.name ?? "—"}</p>
+                  <p>Attending: {night.attendees.map((a) => a.member.name).join(", ") || "—"}</p>
+                  <p>Notes: {night.notes || "—"}</p>
+                  <button className="secondary" onClick={() => void markWatched(night.id)} disabled={busy === night.id}>{busy === night.id ? "Saving..." : "Mark watched"}</button>
+                </div>
+              ))
+            )}
+          </div>
         </div>
 
         <div className="card">
-          <h2>Fairness board</h2>
-          <div className="tableWrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Member</th>
-                  <th>Watched picks</th>
-                  <th>Scheduled picks</th>
-                </tr>
-              </thead>
-              <tbody>
-                {data.fairness.map((row) => (
-                  <tr key={row.member_id}>
-                    <td>{row.name}</td>
-                    <td>{row.watched_picks}</td>
-                    <td>{row.scheduled_picks}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          <p className="footerNote">This is the simplest fairness view: who has had watched picks and who still has future picks queued up.</p>
+          <h2>Add a movie</h2>
+          <p>Drop a new title into the shared backlog.</p>
+          <form action={handleAddMovie}>
+            <label>
+              Movie title
+              <input name="title" required placeholder="Movie title" />
+            </label>
+            <label>
+              Runtime in minutes
+              <input name="runtime_minutes" inputMode="numeric" placeholder="Optional" />
+            </label>
+            <button type="submit" disabled={busy === "addMovie"}>{busy === "addMovie" ? "Adding..." : "Add movie"}</button>
+          </form>
         </div>
       </section>
 
-      <section className="card" style={{ marginTop: 16 }}>
-        <h2>Upcoming / scheduled</h2>
-        <div className="tableWrap" style={{ marginTop: 12 }}>
-          <table>
-            <thead>
-              <tr>
-                <th>Movie</th>
-                <th>Picked by</th>
-                <th>Date</th>
-                <th>Attendees</th>
-                <th>Notes</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              {data.scheduledNights.length === 0 ? (
-                <tr>
-                  <td colSpan={6}>No scheduled nights yet.</td>
-                </tr>
-              ) : (
-                data.scheduledNights.map((night) => (
-                  <tr key={night.id}>
-                    <td>
-                      <strong>{night.movie.title}</strong><br />
-                      <span className="badge warning">{night.movie.runtime_minutes ? `${night.movie.runtime_minutes} min` : "Unknown runtime"}</span>
-                    </td>
-                    <td>{night.picked_by?.name ?? "—"}</td>
-                    <td>{night.scheduled_for ?? "TBD"}</td>
-                    <td>{night.attendees.map((a) => a.member.name).join(", ") || "—"}</td>
-                    <td>{night.notes || "—"}</td>
-                    <td>
-                      <div className="rowActions">
-                        <button className="inline secondary" onClick={() => void markWatched(night.id)} disabled={busy === night.id}>
-                          {busy === night.id ? "Saving..." : "Mark watched"}
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                ))
-              )}
-            </tbody>
-          </table>
+      <section className="card">
+        <h2>Backlog pulse</h2>
+        <div className="stackList compactTop">
+          {availableMovies.map((movie) => {
+            const voteInfo = voteLookup.get(movie.id);
+            return (
+              <div className="listItem" key={movie.id}>
+                <div>
+                  <strong>{movie.title}</strong>
+                  <div className="muted">{movie.runtime_minutes ? `${movie.runtime_minutes} min` : "Runtime unknown"} · {movie.source_list ?? "source unknown"}</div>
+                </div>
+                <span className="badge warning">{voteInfo?.vote_count ?? 0} vote{(voteInfo?.vote_count ?? 0) === 1 ? "" : "s"}</span>
+              </div>
+            );
+          })}
         </div>
       </section>
 
-      <section className="card" style={{ marginTop: 16 }}>
-        <h2>Available backlog</h2>
-        <div className="tableWrap" style={{ marginTop: 12 }}>
-          <table>
-            <thead>
-              <tr>
-                <th>Movie</th>
-                <th>Runtime</th>
-                <th>Source</th>
-              </tr>
-            </thead>
-            <tbody>
-              {availableMovies.map((movie) => (
-                <tr key={movie.id}>
-                  <td>{movie.title}</td>
-                  <td>{movie.runtime_minutes ? `${movie.runtime_minutes} min` : "—"}</td>
-                  <td>{movie.source_list ?? "—"}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </section>
-
-      <section className="card" style={{ marginTop: 16 }}>
+      <section className="card">
         <h2>Watch history</h2>
-        <div className="tableWrap" style={{ marginTop: 12 }}>
-          <table>
-            <thead>
-              <tr>
-                <th>Movie</th>
-                <th>Picked by</th>
-                <th>Watched on</th>
-                <th>Attendees</th>
-              </tr>
-            </thead>
-            <tbody>
-              {data.watchedNights.map((night) => (
-                <tr key={night.id}>
-                  <td>{night.movie.title}</td>
-                  <td>{night.picked_by?.name ?? "—"}</td>
-                  <td>{night.watched_on ?? "—"}</td>
-                  <td>{night.attendees.map((a) => a.member.name).join(", ") || "—"}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+        <div className="stackList compactTop">
+          {data.watchedNights.map((night) => (
+            <div className="listItem" key={night.id}>
+              <div>
+                <strong>{night.movie.title}</strong>
+                <div className="muted">Picked by {night.picked_by?.name ?? "—"} · Watched {formatDate(night.watched_on)}</div>
+              </div>
+              <span className="badge">{night.attendees.length} attending</span>
+            </div>
+          ))}
         </div>
       </section>
     </main>

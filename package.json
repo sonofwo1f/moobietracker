@@ -1,3 +1,6 @@
+"engines": {
+  "node": "20.x"
+}
 {
   "name": "moobie-clurb-site",
   "private": true,

@@ -1,42 +1,29 @@
 import { NextRequest, NextResponse } from "next/server";
 
-const SITE_AUTH_COOKIE = "moobie_access";
+export function middleware(req: NextRequest) {
+  const { pathname, search } = req.nextUrl;
 
-function isProtectedPath(pathname: string) {
   if (
     pathname.startsWith("/_next") ||
-    pathname.startsWith("/favicon") ||
-    pathname.startsWith("/robots.txt") ||
-    pathname.startsWith("/sitemap")
+    pathname.startsWith("/api/login") ||
+    pathname.startsWith("/login") ||
+    pathname.includes(".")
   ) {
-    return false;
-  }
-  if (pathname === "/login" || pathname.startsWith("/api/auth/login") || pathname.startsWith("/api/auth/logout")) {
-    return false;
-  }
-  return true;
-}
-
-export function middleware(request: NextRequest) {
-  const sitePassword = process.env.SITE_PASSWORD?.trim();
-  if (!sitePassword || !isProtectedPath(request.nextUrl.pathname)) {
     return NextResponse.next();
   }
 
-  const authenticated = request.cookies.get(SITE_AUTH_COOKIE)?.value === "1";
-  if (authenticated) return NextResponse.next();
+  const authed = req.cookies.get("moobie_auth")?.value === "yes";
 
-  if (request.nextUrl.pathname.startsWith("/api/")) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  if (!authed) {
+    const url = req.nextUrl.clone();
+    url.pathname = "/login";
+    url.searchParams.set("next", pathname + search);
+    return NextResponse.redirect(url);
   }
 
-  const loginUrl = new URL("/login", request.url);
-  if (request.nextUrl.pathname !== "/") {
-    loginUrl.searchParams.set("next", request.nextUrl.pathname);
-  }
-  return NextResponse.redirect(loginUrl);
+  return NextResponse.next();
 }
 
 export const config = {
-  matcher: ["/((?!.*\\.[\\w]+$).*)"],
+  matcher: ["/((?!api/notify).*)"],
 };
